@@ -2,6 +2,17 @@
 
 從 [TIP 各項指數（一次載入全部）](https://taiwanindex.com.tw/indexes?count=-1&page=1) 取得所有指數代碼與名稱後，可下載單一指數歷史 CSV，或以 `--all` 將**全部指數**在指定日期區間內的歷史資料**合併為同一個 CSV**（每列含指數代碼、指數名稱）。
 
+## 操作指南
+
+ - 全部指數合併成單一csv
+python scrape_tip_history.py --all --start 2026/01/01 --end 2026/03/30 -o output\all_history.csv
+
+ - 只跑前三支指數合併成單一csv
+python scrape_tip_history.py --all --limit 3 --start 2026/03/20 --end 2026/03/30
+
+ - 只抓單一指數
+python scrape_tip_history.py --code IX0232 --start 2026/03/20 --end 2026/03/30
+
 ## 環境需求
 
 - Python 3.10+（建議）
