@@ -13,6 +13,7 @@ from __future__ import annotations
 import argparse
 import csv
 import os
+from datetime import date, timedelta
 import random
 import re
 import tempfile
@@ -133,6 +134,186 @@ def resolve_index_code(index_name: str) -> str:
     raise ValueError(f"列表頁找不到指數名稱：{index_name!r}")
 
 
+def _tip_date_to_iso(s: str) -> str:
+    """CLI 常用 2023/01/01；官網 SSR / flatpickr 多為 2023-01-01。"""
+    s = (s or "").strip().replace(".", "/")
+    if "/" in s:
+        parts = s.split("/")
+        if len(parts) == 3:
+            y, m, d = parts
+            return f"{int(y):04d}-{int(m):02d}-{int(d):02d}"
+    if len(s) >= 10 and s[4] == "-" and s[7] == "-":
+        return s[:10]
+    return s
+
+
+def _normalize_tip_date_display(s: str) -> str:
+    """比對 input 顯示值用（統一成 YYYY-MM-DD）。"""
+    return _tip_date_to_iso(s.replace(".", "/"))
+
+
+def _apply_dates_to_history_inputs(page: Page, start_date: str, end_date: str) -> None:
+    """
+    歷史頁日期由 Vue / flatpickr 綁定。官網 __NUXT__ 為 YYYY-MM-DD；傳入 slash 時 flatpickr
+    可能無法解析，導致 setDate 無效、搜尋仍用 SSR 預設區間。此處一律轉 ISO，並等 flatpickr
+    掛載後再 setDate；必要時用鍵盤輸入備援。
+    """
+    start_iso = _tip_date_to_iso(start_date)
+    end_iso = _tip_date_to_iso(end_date)
+
+    # 等兩個日期欄都掛上 flatpickr（避免 hydration 前就 setDate 無效）
+    try:
+        page.wait_for_function(
+            """() => {
+                const nodes = [...document.querySelectorAll('input.rounded-input[name="date"]')];
+                return nodes.length >= 2 && nodes.slice(0, 2).every((n) => n._flatpickr);
+            }""",
+            timeout=20_000,
+        )
+    except Exception:
+        pass
+
+    ok = page.evaluate(
+        """([start, end]) => {
+            const nodes = [...document.querySelectorAll('input.rounded-input[name="date"]')];
+            if (nodes.length < 2) return false;
+            const setNative = (el, v) => {
+                const desc = Object.getOwnPropertyDescriptor(
+                    window.HTMLInputElement.prototype, 'value'
+                );
+                if (desc && desc.set) desc.set.call(el, v);
+                else el.value = v;
+                el.dispatchEvent(new Event('input', { bubbles: true }));
+                el.dispatchEvent(new Event('change', { bubbles: true }));
+            };
+            const apply = (el, iso) => {
+                const fp = el._flatpickr;
+                const slash = iso.replace(/-/g, '/');
+                if (fp && typeof fp.setDate === 'function') {
+                    let d = null;
+                    try {
+                        d = fp.parseDate(iso);
+                    } catch (e) {}
+                    if (!d) {
+                        try {
+                            d = fp.parseDate(slash);
+                        } catch (e2) {}
+                    }
+                    if (d) fp.setDate(d, true);
+                    else fp.setDate(iso, true);
+                    if (typeof fp.redraw === 'function') fp.redraw();
+                    if (fp.altInput) {
+                        fp.altInput.dispatchEvent(new Event('input', { bubbles: true }));
+                        fp.altInput.dispatchEvent(new Event('change', { bubbles: true }));
+                    }
+                    el.dispatchEvent(new Event('change', { bubbles: true }));
+                    return;
+                }
+                setNative(el, slash);
+            };
+            apply(nodes[0], start);
+            apply(nodes[1], end);
+            return true;
+        }""",
+        [start_iso, end_iso],
+    )
+    if not ok:
+        raise RuntimeError("找不到兩個日期輸入欄，無法套用起訖日期")
+    page.wait_for_timeout(400)
+
+    loc0 = page.locator('input.rounded-input[name="date"]').nth(0)
+    loc1 = page.locator('input.rounded-input[name="date"]').nth(1)
+    try:
+        v0 = _normalize_tip_date_display(loc0.input_value(timeout=3_000))
+        v1 = _normalize_tip_date_display(loc1.input_value(timeout=3_000))
+    except Exception:
+        v0, v1 = "", ""
+
+    if v0 != start_iso or v1 != end_iso:
+        for loc, iso in ((loc0, start_iso), (loc1, end_iso)):
+            loc.click(force=True)
+            loc.press("Control+A")
+            loc.press("Backspace")
+            loc.press_sequentially(iso, delay=35)
+        page.keyboard.press("Tab")
+        page.wait_for_timeout(400)
+
+
+def _wait_after_history_search(page: Page) -> None:
+    """
+    按下「搜尋」後等表格／API 完成再下載。僅固定 sleep 容易在下載到「尚未套用區間」的
+    空檔或舊資料；另補 networkidle 與簡單的 loading 消失等待。
+    """
+    try:
+        page.wait_for_load_state("networkidle", timeout=90_000)
+    except Exception:
+        pass
+    page.wait_for_timeout(2500)
+    try:
+        page.wait_for_function(
+            """() => {
+                const m = document.querySelector('main');
+                if (!m) return true;
+                const spin = m.querySelector(
+                    '[class*="spinner"], [class*="loading"], [aria-busy="true"]'
+                );
+                if (!spin) return true;
+                const st = window.getComputedStyle(spin);
+                return st.display === 'none' || st.visibility === 'hidden' || spin.offsetParent === null;
+            }""",
+            timeout=45_000,
+        )
+    except Exception:
+        pass
+    page.wait_for_timeout(400)
+
+
+def _filter_rows_by_query_range(
+    rows: list[dict[str, str]], start_date: str, end_date: str
+) -> list[dict[str, str]]:
+    """只保留官網 CSV 中、日期落在 CLI 起訖（含）內的列；避免誤下載到整段歷史。"""
+    lo = _tip_date_to_iso(start_date)
+    hi = _tip_date_to_iso(end_date)
+    if lo > hi:
+        lo, hi = hi, lo
+    out: list[dict[str, str]] = []
+    for r in rows:
+        raw = (r.get("日期") or "").strip()
+        if not raw:
+            continue
+        d = _tip_date_to_iso(raw.replace(".", "/"))
+        if len(d) >= 10 and lo <= d[:10] <= hi:
+            out.append(r)
+    return out
+
+
+def _dismiss_blocking_overlays(page: Page) -> None:
+    """
+    搜尋後官網常以 alert-drop-shadow / alert-container 浮層提示（含查無資料），
+    會擋住「下載」按鈕的點擊。先 ESC 關閉，再對仍存在的遮罩關閉 pointer-events。
+    """
+    for _ in range(3):
+        page.keyboard.press("Escape")
+        page.wait_for_timeout(150)
+    page.evaluate(
+        """() => {
+            const sel = '.alert-drop-shadow, .alert-container, [class*="alert-drop-shadow"]';
+            document.querySelectorAll(sel).forEach((el) => {
+                if (!(el instanceof HTMLElement)) return;
+                const r = el.getBoundingClientRect();
+                if (r.width < 10 || r.height < 10) return;
+                const close = el.querySelector(
+                    'button[class*="close"], .btn-close, [aria-label="Close"], '
+                    + '[aria-label="關閉"]'
+                );
+                if (close instanceof HTMLElement) close.click();
+                el.style.pointerEvents = 'none';
+            });
+        }"""
+    )
+    page.wait_for_timeout(200)
+
+
 def _download_history_on_page(
     page: Page,
     index_code: str,
@@ -152,16 +333,15 @@ def _download_history_on_page(
         raise RuntimeError(
             "歷史頁沒有兩個日期輸入欄（此代碼可能為產業類股等專用頁，與一般指數下載介面不同）"
         )
-    # 部分指數會顯示「查無指數相關歷史資料」浮層，一般 click 會被擋；force 可略過擋點擊檢查
-    dates.nth(0).fill(start_date, force=True)
-    dates.nth(1).fill(end_date, force=True)
+    _apply_dates_to_history_inputs(page, start_date, end_date)
 
     main = page.locator("main")
     main.get_by_role("button", name=BTN_SEARCH).last.click()
-    page.wait_for_timeout(1500)
+    _wait_after_history_search(page)
+    _dismiss_blocking_overlays(page)
 
     with page.expect_download(timeout=60_000) as dl_info:
-        main.get_by_role("button", name=BTN_DOWNLOAD).click()
+        main.get_by_role("button", name=BTN_DOWNLOAD).click(force=True)
     download = dl_info.value
     download.save_as(str(dest))
 
@@ -199,7 +379,12 @@ def _read_official_history_rows(csv_path: Path) -> list[dict[str, str]]:
     reader = csv.DictReader(lines)
     if not reader.fieldnames:
         return []
-    return [row for row in reader if any((v or "").strip() for v in row.values())]
+    rows: list[dict[str, str]] = []
+    for row in reader:
+        norm = {(k or "").strip(): (v or "").strip() for k, v in row.items()}
+        if any(norm.values()):
+            rows.append(norm)
+    return rows
 
 
 def scrape_all_merged_csv(
@@ -250,6 +435,7 @@ def scrape_all_merged_csv(
                 try:
                     _download_history_on_page(page, code, start_date, end_date, tmp)
                     rows = _read_official_history_rows(tmp)
+                    rows = _filter_rows_by_query_range(rows, start_date, end_date)
                     for row in rows:
                         writer.writerow(
                             {
@@ -312,6 +498,17 @@ def main() -> None:
     )
     parser.add_argument("--start", default="2026/03/20", help="開始日期 YYYY/MM/DD")
     parser.add_argument("--end", default="2026/03/30", help="結束日期 YYYY/MM/DD")
+    date_quick = parser.add_mutually_exclusive_group()
+    date_quick.add_argument(
+        "--today",
+        action="store_true",
+        help="將起訖日皆設為本機「今天」；與 --start/--end 一併指定時以此為準（不可與 --yesterday 併用）",
+    )
+    date_quick.add_argument(
+        "--yesterday",
+        action="store_true",
+        help="將起訖日皆設為本機「昨天」，適合測試（當日資料尚未上線時）；與 --start/--end 一併指定時以此為準",
+    )
     parser.add_argument(
         "-o",
         "--output",
@@ -330,6 +527,16 @@ def main() -> None:
         help="僅處理前 N 支指數（0 表示不限制，用於測試）",
     )
     args = parser.parse_args()
+
+    if args.today:
+        today_s = date.today().strftime("%Y/%m/%d")
+        args.start = today_s
+        args.end = today_s
+    elif args.yesterday:
+        y = date.today() - timedelta(days=1)
+        ys = y.strftime("%Y/%m/%d")
+        args.start = ys
+        args.end = ys
 
     lim = args.limit if args.limit > 0 else None
 

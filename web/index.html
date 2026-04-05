@@ -1,0 +1,121 @@
+<!DOCTYPE html>
+<html lang="zh-Hant">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>TIP 指數績效比較</title>
+    <link rel="stylesheet" href="styles.css" />
+    <script src="https://cdn.plot.ly/plotly-2.35.2.min.js" defer></script>
+    <script src="https://cdn.jsdelivr.net/npm/papaparse@5.4.1/papaparse.min.js" defer></script>
+    <script src="app.js" defer></script>
+  </head>
+  <body>
+    <header>
+      <h1>TIP 指數績效比較</h1>
+      <p>
+        載入合併 CSV（與爬蟲輸出欄位相同），選擇指數與基準日，檢視淨值走勢、風險統計與多期累積報酬直條圖。Beta
+        係以資料中的「發行量加權股價指數」（代碼 <code>t00</code>）為市場報酬。
+      </p>
+    </header>
+    <main>
+      <div class="panel">
+        <h2>資料與範圍</h2>
+        <div class="controls-grid">
+          <label>
+            載入 CSV
+            <input type="file" id="fileCsv" accept=".csv,text/csv" />
+          </label>
+          <label>
+            或從預設路徑載入（需本機伺服器）
+            <div class="btn-row">
+              <button type="button" id="btnLoadDefault">載入 output/all_history.csv</button>
+            </div>
+          </label>
+          <label>
+            基準日（走勢由此起算，淨值 = 100）
+            <input type="date" id="baseDate" />
+          </label>
+          <label>
+            結束日（可選，留白則用到共同最新交易日）
+            <input type="date" id="endDate" />
+          </label>
+        </div>
+        <label style="margin-top: 0.75rem">
+          指數（複選；按住 Ctrl 多選）
+          <input
+            type="text"
+            id="indexFilter"
+            placeholder="篩選代碼或名稱…"
+            autocomplete="off"
+          />
+          <select id="indexSelect" multiple></select>
+        </label>
+        <div class="btn-row" style="margin-top: 0.75rem">
+          <button type="button" class="primary" id="btnApply">套用 / 更新圖表</button>
+        </div>
+        <p class="hint">
+          請在專案根目錄執行 <code>python -m http.server 8765</code>，再以瀏覽器開啟
+          <code>http://localhost:8765/web/index.html</code>，預設載入才可讀到
+          <code>output/all_history.csv</code>。
+        </p>
+        <p id="statusLine" class="status"></p>
+      </div>
+
+      <section class="block">
+        <h2 class="section-title">淨值走勢（可比較）</h2>
+        <div class="panel">
+          <div id="lineChart" class="chart-wrap"></div>
+          <h3 style="margin: 1rem 0 0.5rem; font-size: 0.95rem; color: var(--muted)">
+            區間風險統計（日報酬，年化係以 √252；與 t00 對齊之交易日）
+          </h3>
+          <div style="overflow-x: auto">
+            <table class="data-table" id="statsTable">
+              <thead>
+                <tr>
+                  <th>指數代碼</th>
+                  <th>指數名稱</th>
+                  <th>Beta（對 t00）</th>
+                  <th>Sortino</th>
+                  <th>VaR 95%（單日歷史）</th>
+                  <th>平均回撤</th>
+                  <th>下行波動率（年化）</th>
+                </tr>
+              </thead>
+              <tbody></tbody>
+            </table>
+          </div>
+        </div>
+      </section>
+
+      <section class="block block-bar-chart">
+        <h2 class="section-title">累積報酬直條圖（台股：紅漲綠跌）</h2>
+        <div class="panel panel--bar-chart">
+          <div class="bar-head">
+            <h2 class="bar-section-title">依資料截止日回溯之交易日累積報酬</h2>
+            <span class="asof" id="barAsOf"></span>
+          </div>
+          <div class="tabs tabs--bar" id="horizonTabs" role="tablist">
+            <button type="button" class="tab active" data-horizon="1">當日</button>
+            <button type="button" class="tab" data-horizon="5">5 日</button>
+            <button type="button" class="tab" data-horizon="20">20 日</button>
+            <button type="button" class="tab" data-horizon="60">60 日</button>
+            <button type="button" class="tab" data-horizon="120">120 日</button>
+          </div>
+          <div id="barChart" class="chart-wrap chart-wrap--bar"></div>
+          <div class="bar-table-wrap">
+            <table class="data-table data-table--bar" id="barTable">
+              <thead>
+                <tr>
+                  <th>指數代碼</th>
+                  <th>指數名稱</th>
+                  <th>累積報酬</th>
+                </tr>
+              </thead>
+              <tbody></tbody>
+            </table>
+          </div>
+        </div>
+      </section>
+    </main>
+  </body>
+</html>
